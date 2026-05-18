@@ -1,0 +1,4 @@
+[lint]
+ignore = [
+    "E712",  # SQLAlchemy 쿼리에서 == True/False 비교는 의도적
+]
