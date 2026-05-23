@@ -533,26 +533,29 @@ def delete_vm(
         delete_params = {"purge": 1} if purge else {}
         proxmox.nodes(server.name).qemu(vmid).delete(**delete_params)
 
-        # 커스텀 포트 iptables 규칙 제거
+        # VmPort에 저장된 실제 external_port 기준으로 iptables 규칙 제거
         if vm_record.internal_ip:
-            custom_ports = db.query(VmPort).filter(
-                VmPort.vm_id == vm_record.id,
-                VmPort.is_default.is_(False),
-            ).all()
-            for port in custom_ports:
+            vm_ports = db.query(VmPort).filter(VmPort.vm_id == vm_record.id).all()
+            for port in vm_ports:
+                source_ip = port.source if port.source and port.source != "0.0.0.0/0" else None
                 protocols = ["tcp", "udp"] if port.protocol == "tcp/udp" else [port.protocol]
                 for proto in protocols:
-                    manage_custom_iptables(
+                    success = manage_custom_iptables(
                         server=server,
                         vm_ip=vm_record.internal_ip,
                         internal_port=port.internal_port,
                         external_port=port.external_port,
                         protocol=proto,
                         action="DELETE",
+                        source_ip=source_ip,
                     )
+                    if not success:
+                        logger.error(
+                            f"VM {vmid} iptables 삭제 실패 - "
+                            f"port {port.external_port}->{port.internal_port} ({proto})"
+                        )
 
-        # 기본 포트 iptables 규칙 제거
-        if vm_record.internal_ip:
+            # 과거 데이터에 VmPort 기본 포트 레코드가 없을 수 있어 기존 계산식도 fallback으로 수행
             manage_iptables(server, vmid, vm_record.internal_ip, action="DELETE")
 
         # VmPort 레코드 일괄 삭제 (VM record 삭제 전 FK 제약 해소)

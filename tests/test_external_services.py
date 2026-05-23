@@ -133,11 +133,11 @@ class TestOAuthStoreConcurrency:
                 _pkce_store.pop(state, None)
 
 
-# ── EXT-TC-04: ADMIN/PROJECT_OWNER 이메일 OAuth 시도 시 409 ──
+# ── EXT-TC-04: OAuth는 일반 USER 계정 기준으로 처리 ──
 
 
 class TestOAuthRoleConflict:
-    """EXT-TC-04: 비USER 역할 이메일로 OAuth 콜백 시 409 반환"""
+    """EXT-TC-04: OAuth는 USER 계정으로 로그인하며 PO 계정과 공존 가능"""
 
     @pytest.fixture
     def oauth_client(self):
@@ -205,8 +205,8 @@ class TestOAuthRoleConflict:
         db.commit()
         assert self._call_callback(oauth_client, "admin@gsm.hs.kr") == 409
 
-    def test_project_owner_email_returns_409(self, db, oauth_client):
-        """PROJECT_OWNER 계정 이메일로 OAuth 시도 시 409"""
+    def test_project_owner_email_can_create_user_account(self, db, oauth_client):
+        """PROJECT_OWNER만 있는 이메일로 OAuth 시도 시 USER 계정을 별도로 생성"""
         db.add(
             User(
                 email="owner@gsm.hs.kr",
@@ -216,7 +216,39 @@ class TestOAuthRoleConflict:
             )
         )
         db.commit()
-        assert self._call_callback(oauth_client, "owner@gsm.hs.kr") == 409
+        status = self._call_callback(oauth_client, "owner@gsm.hs.kr")
+        assert status in (200, 302, 307)
+        assert (
+            db.query(User)
+            .filter(User.email == "owner@gsm.hs.kr", User.role == UserRole.USER)
+            .first()
+            is not None
+        )
+
+    def test_project_owner_email_does_not_block_existing_user(self, db, oauth_client):
+        """USER+PROJECT_OWNER 듀얼 계정이면 OAuth는 USER 계정으로 로그인"""
+        db.add_all(
+            [
+                User(
+                    email="dual@gsm.hs.kr",
+                    hashed_password=None,
+                    role=UserRole.USER,
+                    is_active=True,
+                    oauth_provider="datagsm",
+                    oauth_sub="old-sub",
+                ),
+                User(
+                    email="dual@gsm.hs.kr",
+                    hashed_password="x",
+                    role=UserRole.PROJECT_OWNER,
+                    is_active=True,
+                ),
+            ]
+        )
+        db.commit()
+        status = self._call_callback(oauth_client, "dual@gsm.hs.kr")
+        assert status in (200, 302, 307)
+        assert db.query(User).filter(User.email == "dual@gsm.hs.kr").count() == 2
 
     def test_user_role_does_not_block_oauth(self, db, oauth_client):
         """일반 USER 역할은 차단되지 않음 (409 아님)"""

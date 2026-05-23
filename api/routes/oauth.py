@@ -181,17 +181,20 @@ async def oauth_callback(
     if not email:
         raise HTTPException(status_code=400, detail="이메일 정보를 가져올 수 없습니다.")
 
-    # 5. 기존 유저 매칭 (이메일 기준)
-    # 복합 유니크 제약(email, role)으로 동일 이메일에 여러 역할 계정이 존재할 수 있으므로
-    # 관리자/오너 계정 존재 여부를 먼저 명시적으로 차단
-    if db.query(User).filter(User.email == email, User.role != UserRole.USER).first():
+    # 5. 기존 유저 매칭 (OAuth는 일반 USER 계정으로만 로그인)
+    # 동일 이메일의 PROJECT_OWNER 계정은 별도 계정으로 공존할 수 있습니다.
+    user = (
+        db.query(User).filter(User.email == email, User.role == UserRole.USER).first()
+    )
+
+    if not user and db.query(User).filter(
+        User.email == email,
+        User.role == UserRole.ADMIN,
+    ).first():
         raise HTTPException(
             status_code=409,
             detail="해당 이메일은 다른 권한 계정으로 이미 존재합니다.",
         )
-    user = (
-        db.query(User).filter(User.email == email, User.role == UserRole.USER).first()
-    )
 
     if user:
         # 기존 계정에 OAuth 연결

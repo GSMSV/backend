@@ -2,6 +2,7 @@ import re
 import random
 import logging
 import paramiko
+import ipaddress
 from typing import Optional
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,39 @@ def _validate_ip(ip: str) -> str:
         raise ValueError(f"잘못된 IP 범위: {ip}")
     return ip
 
+
+def _validate_port(port: int, name: str = "port") -> int:
+    """iptables 명령에 사용할 포트 범위를 검증합니다."""
+    if not isinstance(port, int) or not (1 <= port <= 65535):
+        raise ValueError(f"잘못된 {name} 범위: {port}")
+    return port
+
+
+def _normalize_source_ip(source_ip: Optional[str]) -> Optional[str]:
+    """source IP/CIDR을 검증하고 전체 허용 값은 iptables 인자에서 제외합니다."""
+    if source_ip in (None, "", "0.0.0.0/0", "0.0.0.0"):
+        return None
+    try:
+        ipaddress.ip_network(source_ip, strict=False)
+    except ValueError:
+        raise ValueError(f"잘못된 source IP/CIDR 형식: {source_ip}")
+    return source_ip
+
+
+def _iptables_command(table: Optional[str], chain: str, rule_args: str, action: str) -> str:
+    """ADD는 중복을 막고, DELETE는 같은 규칙을 모두 제거하는 명령을 만듭니다."""
+    if action not in {"ADD", "DELETE"}:
+        raise ValueError(f"유효하지 않은 iptables action: {action}")
+
+    base = f"sudo iptables {f'-t {table} ' if table else ''}"
+    if action == "ADD":
+        return f"{base}-C {chain} {rule_args} || {base}-A {chain} {rule_args}"
+    return (
+        f"{base}-L {chain} -n >/dev/null && "
+        f"while {base}-D {chain} {rule_args} 2>/dev/null; do :; done"
+    )
+
+
 def manage_iptables(server: Server, vmid: int, vm_ip: str, action: str = "ADD"):
     """
     Router에 SSH로 접속하여 iptables DNAT 규칙을 추가하거나 삭제합니다.
@@ -48,6 +82,8 @@ def manage_iptables(server: Server, vmid: int, vm_ip: str, action: str = "ADD"):
     # SSH 명령어 인젝션 방지: IP 형식 검증
     _validate_ip(vm_ip)
     _validate_ip(settings.GATEWAY_PUBLIC_IP)
+    if action not in {"ADD", "DELETE"}:
+        raise ValueError(f"유효하지 않은 iptables action: {action}")
 
     if not server.gateway_ip or not server.gateway_user:
         logger.warning(f"서버 {server.name}의 Gateway 정보가 설정되지 않아 iptables 설정을 건너뜁니다.")
@@ -67,13 +103,13 @@ def manage_iptables(server: Server, vmid: int, vm_ip: str, action: str = "ADD"):
     ]
 
     for public_port, internal_port, protocols in port_mapping:
+        _validate_port(public_port, "public_port")
+        _validate_port(internal_port, "internal_port")
         for proto in protocols:
-            if action == "ADD":
-                commands.append(f"sudo iptables -t nat -A PREROUTING -p {proto} -d {settings.GATEWAY_PUBLIC_IP} --dport {public_port} -j DNAT --to-destination {vm_ip}:{internal_port}")
-                commands.append(f"sudo iptables -A FORWARD -p {proto} -d {vm_ip} --dport {internal_port} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT")
-            else:
-                commands.append(f"sudo iptables -t nat -D PREROUTING -p {proto} -d {settings.GATEWAY_PUBLIC_IP} --dport {public_port} -j DNAT --to-destination {vm_ip}:{internal_port}")
-                commands.append(f"sudo iptables -D FORWARD -p {proto} -d {vm_ip} --dport {internal_port} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT")
+            dnat_args = f"-p {proto} -d {settings.GATEWAY_PUBLIC_IP} --dport {public_port} -j DNAT --to-destination {vm_ip}:{internal_port}"
+            forward_args = f"-p {proto} -d {vm_ip} --dport {internal_port} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT"
+            commands.append(_iptables_command("nat", "PREROUTING", dnat_args, action))
+            commands.append(_iptables_command(None, "FORWARD", forward_args, action))
 
     ssh = paramiko.SSHClient()
     try:
@@ -92,6 +128,7 @@ def manage_iptables(server: Server, vmid: int, vm_ip: str, action: str = "ADD"):
             if exit_status != 0:
                 err = stderr_ch.read().decode()
                 logger.error(f"iptables command failed (exit {exit_status}): {err}")
+                return False
 
         # iptables 백업 (변경 후 자동 저장)
         _backup_iptables(ssh, server.gateway_ip)
@@ -133,18 +170,22 @@ def manage_custom_iptables(
         raise ValueError(f"유효하지 않은 프로토콜: {protocol}. tcp 또는 udp만 허용됩니다.")
     _validate_ip(vm_ip)
     _validate_ip(settings.GATEWAY_PUBLIC_IP)
+    _validate_port(internal_port, "internal_port")
+    _validate_port(external_port, "external_port")
+    if action not in {"ADD", "DELETE"}:
+        raise ValueError(f"유효하지 않은 iptables action: {action}")
 
     if not server.gateway_ip or not server.gateway_user:
         logger.warning(f"서버 {server.name}의 Gateway 정보가 설정되지 않아 iptables 설정을 건너뜁니다.")
         return False
 
-    flag = "-A" if action == "ADD" else "-D"
-    if source_ip in ("0.0.0.0/0", "0.0.0.0"):
-        source_ip = None
+    source_ip = _normalize_source_ip(source_ip)
     src = f"-s {source_ip} " if source_ip else ""
+    dnat_args = f"{src}-p {protocol} -d {settings.GATEWAY_PUBLIC_IP} --dport {external_port} -j DNAT --to-destination {vm_ip}:{internal_port}"
+    forward_args = f"{src}-p {protocol} -d {vm_ip} --dport {internal_port} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT"
     commands = [
-        f"sudo iptables -t nat {flag} PREROUTING {src}-p {protocol} -d {settings.GATEWAY_PUBLIC_IP} --dport {external_port} -j DNAT --to-destination {vm_ip}:{internal_port}",
-        f"sudo iptables {flag} FORWARD {src}-p {protocol} -d {vm_ip} --dport {internal_port} -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT",
+        _iptables_command("nat", "PREROUTING", dnat_args, action),
+        _iptables_command(None, "FORWARD", forward_args, action),
     ]
 
     ssh = paramiko.SSHClient()
