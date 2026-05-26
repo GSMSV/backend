@@ -7,12 +7,13 @@ from models.server import Server
 from models.user import User, UserRole
 from models.vm import Vm
 from api.dependencies import get_current_user
+from schemas.monitoring_schema import NodeStatsResponse
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.get("/nodes")
+@router.get("/nodes", response_model=NodeStatsResponse)
 async def get_system_stats(
     db: Session = Depends(get_db), current_user: User = Depends(get_current_user)
 ):

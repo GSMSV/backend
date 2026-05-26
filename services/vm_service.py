@@ -319,7 +319,21 @@ def create_vm(
                 detail=f"노드 '{node_name}'을(를) 찾을 수 없거나 비활성 상태입니다.",
             )
     else:
-        server = get_best_server(db, required_ram_mb=specs["memory"])
+        project_node = settings.PROJECT_NODE_NAME
+        if current_user.role == UserRole.USER:
+            server = get_best_server(
+                db,
+                required_ram_mb=specs["memory"],
+                excluded_nodes={project_node},
+            )
+        elif current_user.role == UserRole.PROJECT_OWNER:
+            server = get_best_server(
+                db,
+                required_ram_mb=specs["memory"],
+                allowed_nodes={project_node},
+            )
+        else:
+            server = get_best_server(db, required_ram_mb=specs["memory"])
 
     # 2. OS별 템플릿 및 유저명 결정
     from schemas.vm_schema import VMOs

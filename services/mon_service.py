@@ -3,6 +3,7 @@ from models.server import Server
 from services.proxmox_client import get_proxmox_for_server
 from fastapi import HTTPException
 import logging
+from typing import Iterable
 
 logger = logging.getLogger(__name__)
 
@@ -30,13 +31,25 @@ def update_server_stats(db: Session, server: Server):
         logger.error(f"서버 {server.name} 상태 업데이트 실패: {e}")
         return 0
 
-def get_best_server(db: Session, required_ram_mb: int) -> Server:
+def get_best_server(
+    db: Session,
+    required_ram_mb: int,
+    *,
+    allowed_nodes: Iterable[str] | None = None,
+    excluded_nodes: Iterable[str] | None = None,
+) -> Server:
     """
     요구되는 RAM(MB)를 감당할 수 있으면서, 가장 여유 자원이 많은 서버를 찾습니다.
     (Resource-Based Auto Provisioning)
     """
-    # 1. 활성화된 모든 서버 목록 가져오기
-    active_servers = db.query(Server).filter(Server.is_active == True).all()
+    # 1. 활성화된 서버 목록 가져오기. 역할 정책상 자동 배정에서 제외/허용할 노드를
+    # 호출자가 지정할 수 있게 한다.
+    query = db.query(Server).filter(Server.is_active == True)
+    if allowed_nodes is not None:
+        query = query.filter(Server.name.in_(set(allowed_nodes)))
+    if excluded_nodes is not None:
+        query = query.filter(~Server.name.in_(set(excluded_nodes)))
+    active_servers = query.all()
     
     if not active_servers:
         raise HTTPException(status_code=500, detail="사용 가능한 활성 서버가 없습니다.")

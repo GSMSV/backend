@@ -374,7 +374,8 @@ class TestChangePassword:
         # USER만 존재
         _make_user(db, email="onlyuser@gsm.hs.kr")
 
-        with patch("api.routes.auth.send_verification_email", return_value=True):
+        with patch("api.routes.auth.send_verification_email", return_value=True), \
+             patch("api.routes.auth._PASSWORD_RESET_MIN_RESPONSE_SECONDS", 0):
             res = client.post(
                 "/api/v1/auth/password-reset/request",
                 json={
@@ -389,6 +390,32 @@ class TestChangePassword:
             .all()
         )
         assert len(recs) == 0, "PO 계정이 없으므로 레코드도 생성되지 않아야 함"
+
+    def test_password_reset_request_oauth_user_silently_succeeds_without_record(
+        self, client, db
+    ):
+        """OAuth 계정은 비밀번호 재설정 이메일/레코드를 만들지 않고 동일 응답을 반환한다."""
+        from models.email_verification import EmailVerification
+        from unittest.mock import AsyncMock, patch
+
+        _make_user(db, email="oauth-reset@gsm.hs.kr", oauth=True)
+        send_mock = AsyncMock(return_value=True)
+
+        with patch("api.routes.auth.send_verification_email", send_mock), \
+             patch("api.routes.auth._PASSWORD_RESET_MIN_RESPONSE_SECONDS", 0):
+            res = client.post(
+                "/api/v1/auth/password-reset/request",
+                json={"email": "oauth-reset@gsm.hs.kr", "login_role": "user"},
+            )
+
+        assert res.status_code == 200
+        send_mock.assert_not_awaited()
+        records = (
+            db.query(EmailVerification)
+            .filter(EmailVerification.email == "oauth-reset@gsm.hs.kr")
+            .all()
+        )
+        assert records == []
 
     def test_login_with_new_password_after_change(self, client, db):
         """변경 → 새 비밀번호 로그인 성공, 옛 비밀번호 로그인 실패."""

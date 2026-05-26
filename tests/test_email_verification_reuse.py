@@ -98,7 +98,8 @@ class TestEmailVerificationReuse:
 
         with patch("api.routes.auth.now_kst", _naive_now), \
              patch("api.routes.auth.send_verification_email", return_value=True):
-            client.post("/api/v1/auth/resend-code", json={"email": "reuse2@gsm.hs.kr"})
+            response = client.post("/api/v1/auth/resend-code", json={"email": "reuse2@gsm.hs.kr"})
+            assert response.status_code == 200
 
             # 이전 코드로 인증 시도 → 최신 레코드와 코드 불일치 → 400
             res = client.post("/api/v1/auth/verify", json={"email": "reuse2@gsm.hs.kr", "code": "222222"})

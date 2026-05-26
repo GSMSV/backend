@@ -9,3 +9,6 @@ TIER_SPECS = {
     # 프로젝트 오너 전용 (최대 8 vCPU, 32GB RAM, 70GB SSD)
     VMTier.PROJECT_CUSTOM: {"memory": 32768, "cores": 8, "disk": 70},
 }
+
+AUTO_SNAP_PREFIX = "auto-daily"
+PROVISIONING_UPTIME_THRESHOLD_SECONDS = 180

@@ -2,11 +2,13 @@ import asyncio
 import base64
 import logging
 from datetime import timedelta
+from typing import Any
+from core.constants import AUTO_SNAP_PREFIX, PROVISIONING_UPTIME_THRESHOLD_SECONDS
 from core.timezone import now_kst
 from fastapi import APIRouter, HTTPException, status, Depends, Request
 from sqlalchemy.orm import Session
 from schemas.vm_schema import VMAction, VMCreate, VMResize, SnapshotCreateRequest
-from services.proxmox_client import get_proxmox_for_server
+from services.proxmox_client import get_proxmox_for_server, raise_proxmox_http_exception
 from models.server import Server
 from services.vm_service import create_vm, delete_vm
 from core.database import get_db
@@ -105,7 +107,7 @@ async def get_vms(
         return {"vms": filtered_vms}
     except Exception as e:
         logger.error(f"[vm] VM 목록 조회 실패: {e}")
-        raise HTTPException(status_code=500, detail="서버 오류가 발생했습니다.")
+        raise_proxmox_http_exception(e, default_detail="서버 오류가 발생했습니다.")
 
 
 @router.get("/admin/all-vms")
@@ -167,7 +169,7 @@ async def get_my_vms(
         server_vms[vm.server_id].append(vm)
 
     result = []
-    proxmox_cache: dict[int, any] = {}
+    proxmox_cache: dict[int, Any] = {}
 
     for vm in user_vms:
         info = {
@@ -192,7 +194,8 @@ async def get_my_vms(
             info["uptime"] = vm_status.get("uptime", 0)
             uptime = vm_status.get("uptime", 0)
             info["provisioning"] = (
-                vm_status.get("status") == "running" and 0 < uptime < 180
+                vm_status.get("status") == "running"
+                and 0 < uptime < PROVISIONING_UPTIME_THRESHOLD_SECONDS
             )
         except Exception:
             pass
@@ -227,9 +230,12 @@ async def get_vm_status(
                 await asyncio.sleep(1)
                 out = proxmox.nodes(node).qemu(vmid).agent("exec-status").get(pid=pid)
                 stdout = base64.b64decode(out.get("out-data", "")).decode(errors="ignore")
-                provisioning = "OK" not in stdout and 0 < uptime < 180
+                provisioning = (
+                    "OK" not in stdout
+                    and 0 < uptime < PROVISIONING_UPTIME_THRESHOLD_SECONDS
+                )
             except Exception:
-                provisioning = 0 < uptime < 180
+                provisioning = 0 < uptime < PROVISIONING_UPTIME_THRESHOLD_SECONDS
 
         # Proxmox 실시간 데이터 + DB 저장 데이터 통합
         return {
@@ -252,7 +258,7 @@ async def get_vm_status(
         }
     except Exception as e:
         logger.error(f"[vm] VM 상태 조회 실패: {e}")
-        raise HTTPException(status_code=500, detail="서버 오류가 발생했습니다.")
+        raise_proxmox_http_exception(e, default_detail="서버 오류가 발생했습니다.")
 
 
 @router.get("/{node}/vms/{vmid}/metrics")
@@ -306,7 +312,7 @@ async def get_vm_metrics(
         return {"vmid": vmid, "timeframe": timeframe, "data": data_points}
     except Exception as e:
         logger.error(f"[vm] 메트릭 조회 실패: {e}")
-        raise HTTPException(status_code=500, detail="서버 오류가 발생했습니다.")
+        raise_proxmox_http_exception(e, default_detail="서버 오류가 발생했습니다.")
 
 
 @router.put("/{node}/vms/{vmid}/resize")
@@ -368,7 +374,7 @@ async def resize_vm(
     except Exception as e:
         db.rollback()
         logger.error(f"[vm] 사양 변경 실패: {e}")
-        raise HTTPException(status_code=500, detail="사양 변경에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="사양 변경에 실패했습니다.")
 
 
 @router.post("/{node}/vms/{vmid}/extend")
@@ -435,7 +441,7 @@ async def control_vm(
         raise
     except Exception as e:
         logger.error(f"[vm] 전원 제어 실패: {e}")
-        raise HTTPException(status_code=500, detail="서버 오류가 발생했습니다.")
+        raise_proxmox_http_exception(e, default_detail="서버 오류가 발생했습니다.")
 
 
 @router.post("/create", status_code=status.HTTP_201_CREATED)
@@ -476,11 +482,18 @@ async def list_snapshots(
     proxmox = get_proxmox_for_server(vm_record.server)
     try:
         snapshots = proxmox.nodes(node).qemu(vmid).snapshot.get()
-        # 'current' 항목(현재 상태)은 제외
-        return [s for s in snapshots if s.get("name") != "current"]
+        # 'current' 항목(현재 상태)은 제외하고 자동 스냅샷 여부를 명시한다.
+        return [
+            {
+                **s,
+                "is_auto": s.get("name", "").startswith(AUTO_SNAP_PREFIX),
+            }
+            for s in snapshots
+            if s.get("name") != "current"
+        ]
     except Exception as e:
         logger.error(f"[vm] 스냅샷 목록 조회 실패: {e}")
-        raise HTTPException(status_code=500, detail="서버 오류가 발생했습니다.")
+        raise_proxmox_http_exception(e, default_detail="서버 오류가 발생했습니다.")
 
 
 @router.post("/{node}/vms/{vmid}/snapshots")
@@ -501,11 +514,13 @@ async def create_snapshot(
     try:
         existing = proxmox.nodes(node).qemu(vmid).snapshot.get()
         real_snaps = [s for s in existing if s.get("name") != "current"]
-        manual_snaps = [s for s in real_snaps if not s.get("name", "").startswith("auto-daily")]
+        manual_snaps = [s for s in real_snaps if not s.get("name", "").startswith(AUTO_SNAP_PREFIX)]
         if manual_snaps and len(manual_snaps) >= 2:
             raise HTTPException(status_code=400, detail="수동 스냅샷은 최대 2개까지 생성할 수 있습니다.")
         if len(real_snaps) >= 3:
             raise HTTPException(status_code=400, detail="스냅샷은 최대 3개까지 생성할 수 있습니다.")
+        if any(s.get("name") == snap_name for s in real_snaps):
+            raise HTTPException(status_code=400, detail="이미 존재하는 스냅샷 이름입니다.")
 
         result = proxmox.nodes(node).qemu(vmid).snapshot.post(
             snapname=snap_name,
@@ -517,7 +532,7 @@ async def create_snapshot(
         raise
     except Exception as e:
         logger.error(f"[vm] 스냅샷 생성 실패: {e}")
-        raise HTTPException(status_code=500, detail="스냅샷 생성에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="스냅샷 생성에 실패했습니다.")
 
 
 @router.post("/{node}/vms/{vmid}/snapshots/{snapname}/rollback")
@@ -537,10 +552,10 @@ async def rollback_snapshot(
         return {"success": True, "message": f"스냅샷 '{snapname}'으로 복원되었습니다.", "task": result}
     except Exception as e:
         logger.error(f"[vm] 스냅샷 복원 실패: {e}")
-        raise HTTPException(status_code=500, detail="스냅샷 복원에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="스냅샷 복원에 실패했습니다.")
 
 
-@router.delete("/{node}/vms/{vmid}/snapshots/{snapname}")
+@router.delete("/{node}/vms/{vmid}/snapshots/{snapname}", status_code=status.HTTP_200_OK)
 async def delete_snapshot(
     node: str,
     vmid: int,
@@ -557,7 +572,7 @@ async def delete_snapshot(
         return {"success": True, "message": f"스냅샷 '{snapname}'이(가) 삭제되었습니다.", "task": result}
     except Exception as e:
         logger.error(f"[vm] 스냅샷 삭제 실패: {e}")
-        raise HTTPException(status_code=500, detail="스냅샷 삭제에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="스냅샷 삭제에 실패했습니다.")
 
 
 @router.get("/{node}/vms/{vmid}/auto-snapshot")
@@ -586,7 +601,7 @@ async def toggle_auto_snapshot(
     return {"enabled": bool(vm_record.auto_snapshot)}
 
 
-@router.delete("/{node}/vms/{vmid}")
+@router.delete("/{node}/vms/{vmid}", status_code=status.HTTP_200_OK)
 @limiter.limit("5/minute")
 async def delete_vm_endpoint(
     request: Request,

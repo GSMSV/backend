@@ -15,6 +15,8 @@ from models.server import Server
 from models.vm import Vm
 from models.notification import Notification
 from schemas.vm_schema import VMCreate, VMTier
+from schemas.vm_schema import SnapshotCreateRequest
+from api.routes.vmcontrol import create_snapshot
 from services.vm_service import (
     create_vm,
     delete_vm,
@@ -22,7 +24,7 @@ from services.vm_service import (
     _get_next_vmid,
 )
 from services.network_service import calculate_ports, manage_iptables
-from services.mon_service import update_server_stats
+from services.mon_service import get_best_server, update_server_stats
 
 # ── 테스트용 DB 엔진 ──────────────────────────────────────────
 
@@ -364,6 +366,58 @@ class TestMonServiceFailure:
         assert server.last_free_ram_mb == 8000
 
 
+class TestBestServerRoleFilters:
+    """자동 노드 배정에서 역할별 노드 정책을 적용한다."""
+
+    def _add_server(self, db, name: str, free_ram: int) -> Server:
+        s = Server(
+            name=name,
+            ip_address=f"192.168.1.{len(name)}",
+            port=8006,
+            api_user="root@pam",
+            api_password="password",
+            is_active=True,
+            base_port=22000,
+            last_free_ram_mb=free_ram,
+        )
+        db.add(s)
+        db.commit()
+        db.refresh(s)
+        return s
+
+    @patch("services.mon_service.update_server_stats", return_value=0)
+    def test_user_auto_assignment_excludes_project_node(self, _mock_update, db, server):
+        """USER 자동 배정은 프로젝트 전용 노드를 후보에서 제외한다."""
+        project = self._add_server(db, "gsmgpu3", 64000)
+        server.last_free_ram_mb = 16000
+        db.commit()
+
+        selected = get_best_server(
+            db,
+            required_ram_mb=2048,
+            excluded_nodes={project.name},
+        )
+
+        assert selected.name == server.name
+
+    @patch("services.mon_service.update_server_stats", return_value=0)
+    def test_project_owner_auto_assignment_allows_only_project_node(
+        self, _mock_update, db, server
+    ):
+        """PROJECT_OWNER 자동 배정은 프로젝트 전용 노드만 후보로 본다."""
+        project = self._add_server(db, "gsmgpu3", 64000)
+        server.last_free_ram_mb = 16000
+        db.commit()
+
+        selected = get_best_server(
+            db,
+            required_ram_mb=2048,
+            allowed_nodes={project.name},
+        )
+
+        assert selected.name == project.name
+
+
 # ── VM-TC-12: MAX_VMS_PER_USER 한도 초과 ─────────────────────
 
 class TestVMCountLimit:
@@ -430,6 +484,48 @@ class TestVMCreationHappyPath:
             Notification.type == "success",
         ).first()
         assert notif is not None
+
+
+class TestSnapshotCreation:
+    """스냅샷 생성 에러 케이스."""
+
+    @pytest.mark.asyncio
+    @patch("api.routes.vmcontrol.get_proxmox_for_server")
+    async def test_duplicate_snapshot_name_returns_400(
+        self, mock_proxmox_fn, db, user, server
+    ):
+        """동일한 스냅샷 이름이 있으면 Proxmox 500 전파 전 400으로 차단한다."""
+        db.add(
+            Vm(
+                hypervisor_vmid=200,
+                name="dup-vm",
+                server_id=server.id,
+                owner_id=user.id,
+                internal_ip="10.0.0.100",
+            )
+        )
+        db.commit()
+
+        proxmox = MagicMock()
+        proxmox.nodes.return_value.qemu.return_value.snapshot.get.return_value = [
+            {"name": "current"},
+            {"name": "dup-snap"},
+        ]
+        mock_proxmox_fn.return_value = proxmox
+
+        from fastapi import HTTPException
+
+        with pytest.raises(HTTPException) as exc_info:
+            await create_snapshot(
+                "test-node",
+                200,
+                SnapshotCreateRequest(name="dup-snap"),
+                db,
+                user,
+            )
+
+        assert exc_info.value.status_code == 400
+        proxmox.nodes.return_value.qemu.return_value.snapshot.post.assert_not_called()
 
 
 # ── VM-TC-14: 정상 VM 삭제 흐름 ──────────────────────────────

@@ -22,6 +22,7 @@ from api.routes import (
     serverless,
 )
 from api.routes.oauth import validate_oauth_store_mode
+from core.constants import AUTO_SNAP_PREFIX
 from core.config import settings
 from sqlalchemy.orm import joinedload
 from core.database import Base, engine, SessionLocal
@@ -262,9 +263,6 @@ async def _iptables_weekly_backup_loop():
             await asyncio.sleep(BACKGROUND_FAST_RETRY_SECONDS)
         else:
             await asyncio.sleep(IPTABLES_BACKUP_INTERVAL_SECONDS)
-
-
-AUTO_SNAP_PREFIX = "auto-daily"
 
 
 async def _wait_snap_delete(

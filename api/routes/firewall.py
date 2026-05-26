@@ -1,9 +1,9 @@
 import logging
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from schemas.fw_schema import FirewallRule, VmPortCreate
-from services.proxmox_client import get_proxmox_for_server
+from services.proxmox_client import get_proxmox_for_server, raise_proxmox_http_exception
 from services.network_service import allocate_random_port, manage_custom_iptables, calculate_ports
 from core.database import get_db
 from models.user import User
@@ -14,14 +14,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-@router.get("/{vmid}/rules")
+@router.get("/{node}/{vmid}/rules")
 async def get_firewall_rules(
+    node: str,
     vmid: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """특정 VM의 방화벽 규칙 목록 조회 (소유자 또는 관리자)"""
-    vm = get_vm_with_owner_check(db, vmid, current_user)
+    vm = get_vm_with_owner_check(db, vmid, current_user, node=node)
     server = vm.server
     proxmox = get_proxmox_for_server(server)
 
@@ -30,18 +31,19 @@ async def get_firewall_rules(
         return {"vmid": vmid, "node": server.name, "rules": rules}
     except Exception as e:
         logger.error(f"[firewall] 규칙 조회 실패: {e}")
-        raise HTTPException(status_code=500, detail="방화벽 규칙 조회에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="방화벽 규칙 조회에 실패했습니다.")
 
 
-@router.post("/{vmid}/rules")
+@router.post("/{node}/{vmid}/rules", status_code=status.HTTP_201_CREATED)
 async def add_firewall_rule(
+    node: str,
     vmid: int,
     rule: FirewallRule,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """특정 VM에 방화벽 규칙 추가 (소유자 또는 관리자)"""
-    vm = get_vm_with_owner_check(db, vmid, current_user)
+    vm = get_vm_with_owner_check(db, vmid, current_user, node=node)
     server = vm.server
     proxmox = get_proxmox_for_server(server)
 
@@ -54,18 +56,19 @@ async def add_firewall_rule(
         return {"success": True, "message": f"VM {vmid} 방화벽 규칙 추가 완료", "rule": rule_data}
     except Exception as e:
         logger.error(f"[firewall] 규칙 추가 실패: {e}")
-        raise HTTPException(status_code=500, detail="방화벽 규칙 추가에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="방화벽 규칙 추가에 실패했습니다.")
 
 
-@router.delete("/{vmid}/rules/{pos}")
+@router.delete("/{node}/{vmid}/rules/{pos}", status_code=status.HTTP_200_OK)
 async def delete_firewall_rule(
+    node: str,
     vmid: int,
     pos: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """특정 VM의 방화벽 규칙 삭제 (소유자 또는 관리자)"""
-    vm = get_vm_with_owner_check(db, vmid, current_user)
+    vm = get_vm_with_owner_check(db, vmid, current_user, node=node)
     server = vm.server
     proxmox = get_proxmox_for_server(server)
 
@@ -74,7 +77,7 @@ async def delete_firewall_rule(
         return {"success": True, "message": f"VM {vmid} 방화벽 규칙({pos}번) 삭제 완료"}
     except Exception as e:
         logger.error(f"[firewall] 규칙 삭제 실패: {e}")
-        raise HTTPException(status_code=500, detail="방화벽 규칙 삭제에 실패했습니다.")
+        raise_proxmox_http_exception(e, default_detail="방화벽 규칙 삭제에 실패했습니다.")
 
 
 # ── 커스텀 포트 할당 (30000~39999) ───────────────────────────────────────────
@@ -236,7 +239,7 @@ async def restore_default_ports(
     return {"restored": len(missing)}
 
 
-@router.delete("/{node}/{vmid}/ports/{port_id}")
+@router.delete("/{node}/{vmid}/ports/{port_id}", status_code=status.HTTP_200_OK)
 async def delete_custom_port(
     node: str,
     vmid: int,

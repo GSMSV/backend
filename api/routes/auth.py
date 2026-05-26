@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from datetime import timedelta
@@ -689,6 +690,20 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 
 
 _RESET_ROLE_MAP = {"user": UserRole.USER, "project_owner": UserRole.PROJECT_OWNER}
+_PASSWORD_RESET_MIN_RESPONSE_SECONDS = 0.5
+
+
+async def _pad_password_reset_response(started_at: float) -> None:
+    remaining = _PASSWORD_RESET_MIN_RESPONSE_SECONDS - (time.monotonic() - started_at)
+    if remaining > 0:
+        await asyncio.sleep(remaining)
+
+
+def _password_reset_request_response(email: str) -> dict[str, str]:
+    return {
+        "message": "등록된 이메일이라면 인증 코드가 발송됩니다.",
+        "email": email,
+    }
 
 
 def _reset_signup_role(login_role: str) -> str:
@@ -702,6 +717,7 @@ async def request_password_reset(
     request: Request, body: PasswordResetRequest, db: Session = Depends(get_db)
 ):
     """비밀번호 재설정 1단계: 이메일+role로 인증 코드를 발송합니다."""
+    started_at = time.monotonic()
     target_role = _RESET_ROLE_MAP[body.login_role]
     # 해당 이메일+role의 활성 계정이 있는지 확인
     user = (
@@ -726,10 +742,13 @@ async def request_password_reset(
         )
     if not user:
         # 보안상 존재하지 않는 이메일이어도 같은 메시지 반환
-        return {
-            "message": "등록된 이메일이라면 인증 코드가 발송됩니다.",
-            "email": body.email,
-        }
+        await _pad_password_reset_response(started_at)
+        return _password_reset_request_response(body.email)
+    if not user.hashed_password:
+        # OAuth 계정은 비밀번호가 없으므로 재설정 레코드/이메일을 만들지 않는다.
+        # 응답은 동일하게 유지해 계정 유형 노출을 피한다.
+        await _pad_password_reset_response(started_at)
+        return _password_reset_request_response(body.email)
 
     sr = _reset_signup_role(body.login_role)
     # 기존 미인증 비밀번호 재설정 레코드 삭제 (같은 role만)
@@ -756,10 +775,8 @@ async def request_password_reset(
     if not sent:
         raise HTTPException(status_code=500, detail="인증 이메일 발송에 실패했습니다.")
 
-    return {
-        "message": "등록된 이메일이라면 인증 코드가 발송됩니다.",
-        "email": body.email,
-    }
+    await _pad_password_reset_response(started_at)
+    return _password_reset_request_response(body.email)
 
 
 @router.post("/password-reset/confirm")
