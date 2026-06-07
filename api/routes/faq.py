@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from pydantic import BaseModel, field_validator
 from typing import Optional
 
@@ -55,18 +55,20 @@ class FaqQuestionResponse(BaseModel):
 # ── Endpoints ────────────────────────────────────────────────
 
 @router.get("", response_model=list[FaqQuestionResponse])
-async def get_faq_questions(
+def get_faq_questions(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """FAQ 질문 목록 조회 — 본인 질문만 (관리자는 전체)"""
     from models.user import UserRole
 
+    # user 를 함께 로드(joinedload)해 q.user.email 접근 시 발생하던 N+1 제거
+    base_query = db.query(FaqQuestion).options(joinedload(FaqQuestion.user))
     if current_user.role == UserRole.ADMIN:
-        questions = db.query(FaqQuestion).order_by(FaqQuestion.created_at.desc()).all()
+        questions = base_query.order_by(FaqQuestion.created_at.desc()).all()
     else:
         questions = (
-            db.query(FaqQuestion)
+            base_query
             .filter(FaqQuestion.user_id == current_user.id)
             .order_by(FaqQuestion.created_at.desc())
             .all()
@@ -86,7 +88,7 @@ async def get_faq_questions(
 
 
 @router.post("", response_model=FaqQuestionResponse)
-async def create_faq_question(
+def create_faq_question(
     body: FaqQuestionCreate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -110,7 +112,7 @@ async def create_faq_question(
 
 
 @router.put("/{question_id}/answer", response_model=FaqQuestionResponse)
-async def answer_faq_question(
+def answer_faq_question(
     question_id: int,
     body: FaqAnswerCreate,
     admin: User = Depends(get_current_active_admin),
@@ -137,7 +139,7 @@ async def answer_faq_question(
 
 
 @router.delete("/{question_id}")
-async def delete_faq_question(
+def delete_faq_question(
     question_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),

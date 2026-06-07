@@ -15,7 +15,7 @@ router = APIRouter()
 
 
 @router.get("/{vmid}/rules")
-async def get_firewall_rules(
+def get_firewall_rules(
     vmid: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -34,7 +34,7 @@ async def get_firewall_rules(
 
 
 @router.post("/{vmid}/rules")
-async def add_firewall_rule(
+def add_firewall_rule(
     vmid: int,
     rule: FirewallRule,
     db: Session = Depends(get_db),
@@ -58,7 +58,7 @@ async def add_firewall_rule(
 
 
 @router.delete("/{vmid}/rules/{pos}")
-async def delete_firewall_rule(
+def delete_firewall_rule(
     vmid: int,
     pos: int,
     db: Session = Depends(get_db),
@@ -80,7 +80,7 @@ async def delete_firewall_rule(
 # ── 커스텀 포트 할당 (30000~39999) ───────────────────────────────────────────
 
 @router.get("/{node}/{vmid}/ports")
-async def get_custom_ports(
+def get_custom_ports(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -109,7 +109,7 @@ async def get_custom_ports(
 
 
 @router.post("/{node}/{vmid}/ports", status_code=201)
-async def add_custom_port(
+def add_custom_port(
     node: str,
     vmid: int,
     body: VmPortCreate,
@@ -177,7 +177,7 @@ async def add_custom_port(
 
 
 @router.post("/{node}/{vmid}/ports/defaults/restore")
-async def restore_default_ports(
+def restore_default_ports(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -237,7 +237,7 @@ async def restore_default_ports(
 
 
 @router.delete("/{node}/{vmid}/ports/{port_id}")
-async def delete_custom_port(
+def delete_custom_port(
     node: str,
     vmid: int,
     port_id: int,

@@ -69,7 +69,7 @@ def _generate_pkce() -> tuple[str, str]:
 
 @router.get("/authorize")
 @limiter.limit("10/minute")
-async def oauth_authorize(request: Request):
+def oauth_authorize(request: Request):
     """DataGSM OAuth 인증 시작 — 사용자를 DataGSM 로그인 페이지로 리다이렉트"""
     state = secrets.token_urlsafe(32)
     verifier, challenge = _generate_pkce()
@@ -253,7 +253,7 @@ class TokenExchangeRequest(BaseModel):
 
 
 @router.post("/exchange")
-async def exchange_temp_code(body: TokenExchangeRequest):
+def exchange_temp_code(body: TokenExchangeRequest):
     """임시 코드를 JWT 토큰으로 교환 (1회용) — httpOnly 쿠키에 설정"""
     entry = _token_store.pop(body.code, None)
     if not entry or entry["expires"] < time.time():

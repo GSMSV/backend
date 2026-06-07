@@ -9,7 +9,7 @@ router = APIRouter()
 
 
 @router.get("")
-async def get_notifications(
+def get_notifications(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -34,7 +34,7 @@ async def get_notifications(
 
 
 @router.patch("/{notification_id}/read")
-async def mark_as_read(
+def mark_as_read(
     notification_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -52,7 +52,7 @@ async def mark_as_read(
 
 
 @router.post("/read-all")
-async def mark_all_as_read(
+def mark_all_as_read(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -65,7 +65,7 @@ async def mark_all_as_read(
 
 
 @router.delete("/{notification_id}")
-async def delete_notification(
+def delete_notification(
     notification_id: int,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),

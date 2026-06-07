@@ -326,7 +326,7 @@ async def signup_project(body: ProjectSignupRequest, db: Session = Depends(get_d
 
 @router.post("/verify")
 @limiter.limit("10/minute")
-async def verify_email(
+def verify_email(
     request: Request, body: VerifyCodeRequest, db: Session = Depends(get_db)
 ):
     """
@@ -421,7 +421,7 @@ async def verify_email(
 
 
 @router.get("/pending-approvals")
-async def get_pending_approvals(
+def get_pending_approvals(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -452,7 +452,7 @@ async def get_pending_approvals(
 
 
 @router.post("/approve/{user_id}")
-async def approve_project_owner(
+def approve_project_owner(
     user_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -475,7 +475,7 @@ async def approve_project_owner(
 
 
 @router.post("/reject/{user_id}")
-async def reject_project_owner(
+def reject_project_owner(
     user_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -568,7 +568,7 @@ async def resend_code(
 
 @router.post("/login", response_model=Token)
 @limiter.limit("10/minute")
-async def login(
+def login(
     request: Request,
     db: Session = Depends(get_db),
     form_data: OAuth2PasswordRequestForm = Depends(),
@@ -624,7 +624,7 @@ async def login(
 
 
 @router.post("/refresh")
-async def refresh_token(
+def refresh_token(
     request: Request,
     body: RefreshRequest = None,
     db: Session = Depends(get_db),
@@ -668,7 +668,7 @@ async def refresh_token(
 
 
 @router.get("/me")
-async def read_users_me(current_user: User = Depends(get_current_user)):
+def read_users_me(current_user: User = Depends(get_current_user)):
     """현재 로그인된 사용자의 정보를 조회합니다."""
     return {
         "id": current_user.id,
@@ -764,7 +764,7 @@ async def request_password_reset(
 
 @router.post("/password-reset/confirm")
 @limiter.limit("5/minute")
-async def confirm_password_reset(
+def confirm_password_reset(
     request: Request, body: PasswordResetConfirm, db: Session = Depends(get_db)
 ):
     """비밀번호 재설정 2단계: 인증 코드 확인 + 해당 role 계정의 비밀번호만 변경."""
@@ -839,7 +839,7 @@ async def confirm_password_reset(
 
 
 @router.put("/change-password")
-async def change_password(
+def change_password(
     body: ChangePasswordRequest,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -926,7 +926,7 @@ async def upload_avatar(
 
 
 @router.delete("/avatar")
-async def delete_avatar(
+def delete_avatar(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -945,7 +945,7 @@ async def delete_avatar(
 
 
 @router.post("/logout")
-async def logout():
+def logout():
     """로그아웃 — httpOnly 쿠키 삭제."""
     response = JSONResponse(content={"message": "로그아웃 되었습니다."})
     _clear_auth_cookies(response)

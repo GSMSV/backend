@@ -1,12 +1,12 @@
-import asyncio
 import base64
 import logging
+import time
 from datetime import timedelta
 from core.timezone import now_kst
 from fastapi import APIRouter, HTTPException, status, Depends, Request
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from schemas.vm_schema import VMAction, VMCreate, VMResize, SnapshotCreateRequest
-from services.proxmox_client import get_proxmox_for_server
+from services.proxmox_client import get_proxmox_for_server, gather_per_server
 from models.server import Server
 from services.vm_service import create_vm, delete_vm
 from core.database import get_db
@@ -22,68 +22,72 @@ router = APIRouter()
 
 
 @router.get("/nodes")
-async def get_nodes(
+def get_nodes(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_admin),
 ):
     """Proxmox 노드 목록 조회 (관리자 전용)"""
     servers = db.query(Server).filter(Server.is_active == True).all()
+
+    def fetch(server):
+        return get_proxmox_for_server(server).nodes(server.name).status.get()
+
+    status_by_id = gather_per_server(servers, fetch)
     result = []
     for server in servers:
-        try:
-            proxmox = get_proxmox_for_server(server)
-            node_status = proxmox.nodes(server.name).status.get()
-            result.append({"name": server.name, "status": "online", "detail": node_status})
-        except Exception:
+        detail = status_by_id.get(server.id)
+        if detail is not None:
+            result.append({"name": server.name, "status": "online", "detail": detail})
+        else:
             result.append({"name": server.name, "status": "offline", "detail": None})
     return {"nodes": result}
 
 
+def _fetch_node_resources(server):
+    """단일 노드의 리소스 사용량 조회 (스레드풀에서 서버별 병렬 실행)."""
+    proxmox = get_proxmox_for_server(server)
+    s = proxmox.nodes(server.name).status.get()
+    cpu_used = round(s.get("cpu", 0) * 100, 1)
+    mem = s.get("memory", {})
+    mem_used_gb = round(mem.get("used", 0) / (1024 ** 3), 1)
+    mem_total_gb = round(mem.get("total", 0) / (1024 ** 3), 1)
+    # lvm-thin 스토리지 합산 (data, vm 등 여러 파티션)
+    disk_used = 0
+    disk_total = 0
+    try:
+        storages = proxmox.nodes(server.name).storage.get()
+        for st in storages:
+            if st.get("type") == "lvmthin":
+                disk_used += st.get("used", 0)
+                disk_total += st.get("total", 0)
+    except Exception:
+        pass
+    return {
+        "online": True,
+        "cpu_percent": cpu_used,
+        "mem_used_gb": mem_used_gb,
+        "mem_total_gb": mem_total_gb,
+        "disk_used_gb": round(disk_used / (1024 ** 3), 1),
+        "disk_total_gb": round(disk_total / (1024 ** 3), 1),
+    }
+
+
 @router.get("/nodes/resources")
-async def get_nodes_resources(
+def get_nodes_resources(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """노드별 리소스 사용량 조회 (배포 페이지용)"""
     servers = db.query(Server).filter(Server.is_active == True).all()
-    result = {}
-    for server in servers:
-        try:
-            proxmox = get_proxmox_for_server(server)
-            s = proxmox.nodes(server.name).status.get()
-            cpu_used = round(s.get("cpu", 0) * 100, 1)
-            mem = s.get("memory", {})
-            mem_used_gb = round(mem.get("used", 0) / (1024 ** 3), 1)
-            mem_total_gb = round(mem.get("total", 0) / (1024 ** 3), 1)
-            # lvm-thin 스토리지 합산 (data, vm 등 여러 파티션)
-            disk_used = 0
-            disk_total = 0
-            try:
-                storages = proxmox.nodes(server.name).storage.get()
-                for st in storages:
-                    if st.get("type") == "lvmthin":
-                        disk_used += st.get("used", 0)
-                        disk_total += st.get("total", 0)
-            except Exception:
-                pass
-            disk_used_gb = round(disk_used / (1024 ** 3), 1)
-            disk_total_gb = round(disk_total / (1024 ** 3), 1)
-            result[server.name] = {
-                "online": True,
-                "cpu_percent": cpu_used,
-                "mem_used_gb": mem_used_gb,
-                "mem_total_gb": mem_total_gb,
-                "disk_used_gb": disk_used_gb,
-                "disk_total_gb": disk_total_gb,
-            }
-        except Exception as e:
-            logger.warning(f"[NodeResources] {server.name} 조회 실패: {e}")
-            result[server.name] = {"online": False}
-    return result
+    res_by_id = gather_per_server(servers, _fetch_node_resources)
+    return {
+        server.name: res_by_id.get(server.id, {"online": False})
+        for server in servers
+    }
 
 
 @router.get("/{node}/vms")
-async def get_vms(
+def get_vms(
     node: str,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -109,36 +113,38 @@ async def get_vms(
 
 
 @router.get("/admin/all-vms")
-async def get_all_vms(
+def get_all_vms(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_active_admin),
 ):
     """전체 VM 목록 조회 — 노드별 그룹핑 (관리자 전용)"""
     servers = db.query(Server).filter(Server.is_active == True).all()
-    all_db_vms = db.query(Vm).all()
+    # owner 를 함께 로드(joinedload)해 vm.owner.email 접근 시 발생하던 N+1 제거
+    all_db_vms = db.query(Vm).options(joinedload(Vm.owner)).all()
 
-    # DB VM을 server_id로 매핑
-    vm_by_server: dict[int, list[Vm]] = {}
+    # DB VM을 server_id별 info dict 리스트로 매핑 (라이브 상태는 이후 병렬로 채움).
+    # ORM 속성 접근은 메인 스레드에서 끝내고, 워커 스레드에는 dict 만 넘긴다.
+    info_by_server: dict[int, list] = {}
     for vm in all_db_vms:
-        vm_by_server.setdefault(vm.server_id, []).append(vm)
-
-    nodes = []
+        info_by_server.setdefault(vm.server_id, []).append({
+            "vmid": vm.hypervisor_vmid,
+            "name": vm.display_name or vm.name,
+            "node": None,  # 아래에서 서버명으로 채움
+            "status": "unknown",
+            "owner_email": vm.owner.email if vm.owner else None,
+            "internal_ip": vm.internal_ip,
+            "created_at": str(vm.created_at) if vm.created_at else None,
+            "expires_at": str(vm.expires_at) if vm.expires_at else None,
+        })
     for server in servers:
-        node_vms = []
-        for vm in vm_by_server.get(server.id, []):
-            info = {
-                "vmid": vm.hypervisor_vmid,
-                "name": vm.display_name or vm.name,
-                "node": server.name,
-                "status": "unknown",
-                "owner_email": vm.owner.email if vm.owner else None,
-                "internal_ip": vm.internal_ip,
-                "created_at": str(vm.created_at) if vm.created_at else None,
-                "expires_at": str(vm.expires_at) if vm.expires_at else None,
-            }
+        for info in info_by_server.get(server.id, []):
+            info["node"] = server.name
+
+    def fetch(server):
+        proxmox = get_proxmox_for_server(server)
+        for info in info_by_server.get(server.id, []):
             try:
-                proxmox = get_proxmox_for_server(server)
-                vm_status = proxmox.nodes(server.name).qemu(vm.hypervisor_vmid).status.current.get()
+                vm_status = proxmox.nodes(server.name).qemu(info["vmid"]).status.current.get()
                 info["status"] = vm_status.get("status", "unknown")
                 info["cpu_usage"] = vm_status.get("cpu", 0)
                 info["maxmem"] = vm_status.get("maxmem", 0)
@@ -147,28 +153,37 @@ async def get_all_vms(
                 info["uptime"] = vm_status.get("uptime", 0)
             except Exception:
                 pass
-            node_vms.append(info)
-        nodes.append({"name": server.name, "vms": node_vms})
+
+    # VM이 있는 서버만 노드별로 병렬 조회 (서버마다 독립 연결 → 스레드 안전)
+    gather_per_server([s for s in servers if info_by_server.get(s.id)], fetch)
+
+    nodes = [
+        {"name": server.name, "vms": info_by_server.get(server.id, [])}
+        for server in servers
+    ]
     return {"nodes": nodes}
 
 
 @router.get("/my-vms")
-async def get_my_vms(
+def get_my_vms(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """현재 사용자가 소유한 모든 VM 목록 조회 (모든 노드 통합)"""
-    user_vms = db.query(Vm).filter(Vm.owner_id == current_user.id).all()
+    # server 를 함께 로드(joinedload)해 vm.server.name 접근 시 발생하던 N+1 제거
+    user_vms = (
+        db.query(Vm)
+        .options(joinedload(Vm.server))
+        .filter(Vm.owner_id == current_user.id)
+        .all()
+    )
 
-    # 서버별로 VM 그룹핑 → Proxmox 연결 재사용
+    # 서버별로 info dict 그룹핑. ORM 접근은 메인 스레드에서 끝내고,
+    # 원래 VM 순서를 유지하기 위해 result 리스트에 같은 dict 참조를 담아둔다.
     from collections import defaultdict
-    server_vms: dict[int, list] = defaultdict(list)
-    for vm in user_vms:
-        server_vms[vm.server_id].append(vm)
-
+    infos_by_server: dict[int, list] = defaultdict(list)
+    servers_by_id: dict[int, object] = {}
     result = []
-    proxmox_cache: dict[int, any] = {}
-
     for vm in user_vms:
         info = {
             "vmid": vm.hypervisor_vmid,
@@ -179,29 +194,35 @@ async def get_my_vms(
             "created_at": str(vm.created_at) if vm.created_at else None,
             "expires_at": str(vm.expires_at) if vm.expires_at else None,
         }
-        try:
-            if vm.server_id not in proxmox_cache:
-                proxmox_cache[vm.server_id] = get_proxmox_for_server(vm.server)
-            proxmox = proxmox_cache[vm.server_id]
-            vm_status = proxmox.nodes(vm.server.name).qemu(vm.hypervisor_vmid).status.current.get()
-            info["status"] = vm_status.get("status", "unknown")
-            info["cpu_usage"] = vm_status.get("cpu", 0)
-            info["maxmem"] = vm_status.get("maxmem", 0)
-            info["mem_usage"] = vm_status.get("mem", 0)
-            info["maxdisk"] = vm_status.get("maxdisk", 0)
-            info["uptime"] = vm_status.get("uptime", 0)
-            uptime = vm_status.get("uptime", 0)
-            info["provisioning"] = (
-                vm_status.get("status") == "running" and 0 < uptime < 180
-            )
-        except Exception:
-            pass
+        infos_by_server[vm.server_id].append(info)
+        servers_by_id[vm.server_id] = vm.server
         result.append(info)
+
+    def fetch(server):
+        proxmox = get_proxmox_for_server(server)
+        for info in infos_by_server[server.id]:
+            try:
+                vm_status = proxmox.nodes(server.name).qemu(info["vmid"]).status.current.get()
+                info["status"] = vm_status.get("status", "unknown")
+                info["cpu_usage"] = vm_status.get("cpu", 0)
+                info["maxmem"] = vm_status.get("maxmem", 0)
+                info["mem_usage"] = vm_status.get("mem", 0)
+                info["maxdisk"] = vm_status.get("maxdisk", 0)
+                uptime = vm_status.get("uptime", 0)
+                info["uptime"] = uptime
+                info["provisioning"] = (
+                    vm_status.get("status") == "running" and 0 < uptime < 180
+                )
+            except Exception:
+                pass
+
+    # 노드별로 병렬 조회 (서버마다 독립 연결 → 스레드 안전)
+    gather_per_server(list(servers_by_id.values()), fetch)
     return result
 
 
 @router.get("/{node}/vms/{vmid}/status")
-async def get_vm_status(
+def get_vm_status(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -224,7 +245,7 @@ async def get_vm_status(
                     command="test -f /home/ubuntu/ok.txt && echo OK || echo NOTYET"
                 )
                 pid = result.get("pid")
-                await asyncio.sleep(1)
+                time.sleep(1)
                 out = proxmox.nodes(node).qemu(vmid).agent("exec-status").get(pid=pid)
                 stdout = base64.b64decode(out.get("out-data", "")).decode(errors="ignore")
                 provisioning = "OK" not in stdout and 0 < uptime < 180
@@ -256,7 +277,7 @@ async def get_vm_status(
 
 
 @router.get("/{node}/vms/{vmid}/metrics")
-async def get_vm_metrics(
+def get_vm_metrics(
     node: str,
     vmid: int,
     timeframe: str = "hour",
@@ -310,7 +331,7 @@ async def get_vm_metrics(
 
 
 @router.put("/{node}/vms/{vmid}/resize")
-async def resize_vm(
+def resize_vm(
     node: str,
     vmid: int,
     body: VMResize,
@@ -372,7 +393,7 @@ async def resize_vm(
 
 
 @router.post("/{node}/vms/{vmid}/extend")
-async def extend_vm(
+def extend_vm(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -405,7 +426,7 @@ async def extend_vm(
 
 @router.post("/{node}/vms/{vmid}/action")
 @limiter.limit("10/minute")
-async def control_vm(
+def control_vm(
     request: Request,
     node: str,
     vmid: int,
@@ -440,7 +461,7 @@ async def control_vm(
 
 @router.post("/create", status_code=status.HTTP_201_CREATED)
 @limiter.limit("5/minute")
-async def create_vm_endpoint(
+def create_vm_endpoint(
     request: Request,
     vm_config: VMCreate,
     db: Session = Depends(get_db),
@@ -464,7 +485,7 @@ async def create_vm_endpoint(
 
 
 @router.get("/{node}/vms/{vmid}/snapshots")
-async def list_snapshots(
+def list_snapshots(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -484,7 +505,7 @@ async def list_snapshots(
 
 
 @router.post("/{node}/vms/{vmid}/snapshots")
-async def create_snapshot(
+def create_snapshot(
     node: str,
     vmid: int,
     body: SnapshotCreateRequest,
@@ -521,7 +542,7 @@ async def create_snapshot(
 
 
 @router.post("/{node}/vms/{vmid}/snapshots/{snapname}/rollback")
-async def rollback_snapshot(
+def rollback_snapshot(
     node: str,
     vmid: int,
     snapname: str,
@@ -541,7 +562,7 @@ async def rollback_snapshot(
 
 
 @router.delete("/{node}/vms/{vmid}/snapshots/{snapname}")
-async def delete_snapshot(
+def delete_snapshot(
     node: str,
     vmid: int,
     snapname: str,
@@ -561,7 +582,7 @@ async def delete_snapshot(
 
 
 @router.get("/{node}/vms/{vmid}/auto-snapshot")
-async def get_auto_snapshot(
+def get_auto_snapshot(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -573,7 +594,7 @@ async def get_auto_snapshot(
 
 
 @router.put("/{node}/vms/{vmid}/auto-snapshot")
-async def toggle_auto_snapshot(
+def toggle_auto_snapshot(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
@@ -588,7 +609,7 @@ async def toggle_auto_snapshot(
 
 @router.delete("/{node}/vms/{vmid}")
 @limiter.limit("5/minute")
-async def delete_vm_endpoint(
+def delete_vm_endpoint(
     request: Request,
     node: str,
     vmid: int,
