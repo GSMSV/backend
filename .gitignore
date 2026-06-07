@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# 로컬 테스트 아티팩트
+test.db
+test_*.db
+*.sqlite3
