@@ -9,7 +9,7 @@ router = APIRouter()
 
 
 @router.get("/{node}/{vmid}/ports")
-async def get_forwarded_ports(
+def get_forwarded_ports(
     node: str,
     vmid: int,
     db: Session = Depends(get_db),
